@@ -58,6 +58,7 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TokenNotSupported();
     error DSCEngine__TransferFailed();
     error DSCEngine__BreaksHealthFactor();
+    error DSCEngine__MintFailed();
 
     //////////////////////
     // State Variables  //
@@ -78,7 +79,8 @@ contract DSCEngine is ReentrancyGuard {
     //////////////////
     // Events       //
     //////////////////
-    event CollateralDeposited(address indexed user, address indexed token, uint256 amount);
+    event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(address indexed user, address indexed token, uint256 indexed amount);
 
     //////////////////
     // Modifiers    //
@@ -116,7 +118,21 @@ contract DSCEngine is ReentrancyGuard {
     ///////////////////////////
     // External Functions    //
     ///////////////////////////
-    function depositCollateralAndMintDsc() external {}
+
+    /*
+     * @param tokenCollateralAddress The address of the collateral token
+     * @param amountCollateral The amount of collateral to deposit
+     * @param amountDscToMint The amount of decentralized stable coin to mint
+     * @notice this function will deposit collateral and mint DSC in one transaction
+     */
+    function depositCollateralAndMintDsc(
+        address tokenCollateralAddress,
+        uint256 amountCollateral,
+        uint256 amountDscToMint
+    ) external {
+        depositCollateral(tokenCollateralAddress, amountCollateral);
+        mintDsc(amountDscToMint);
+    }
 
     /*
      * @notice follows CEI
@@ -124,7 +140,7 @@ contract DSCEngine is ReentrancyGuard {
      * @param amountCollateral The amount of collateral to deposit
      */
     function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
-        external
+        public
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
@@ -137,25 +153,91 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function redeemCollateralForDsc() external {}
+    /*
+    *
+    * @param tokenCollateralAddress The address of the collateral token
+    * @param amountCollateral The amount of collateral to redeem
+    * @param amountDscToBurn The amount of decentralized stable coin to burn
+    * This function will redeem collateral and mint DSC in one transaction
+    */
 
-    function redeemCollateral() external {}
+    function redeemCollateralForDsc(address tokenCollateralAddress, uint256 amountCollateral, uint256 amountDscToBurn)
+        external
+    {
+        burnDsc(amountDscToBurn);
+        redeemCollateral(tokenCollateralAddress, amountCollateral);
+        // redeemCollateral already checks the health factor
+    }
+
+    // in order to redeem collatgeral:
+    // 1. health factor must be over 1 AFTER collateral pulled
+    // DRY: Don't repeat yourself
+    // CEI: Check-Effect-Interact
+    function redeemCollateral(address tokenCollateralAddress, uint256 amountCollateral)
+        public
+        moreThanZero(amountCollateral)
+        nonReentrant
+    {
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] -= amountCollateral;
+        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, amountCollateral);
+        // _calculateHealthFactorAfter()
+        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, amountCollateral);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        _reverIfHealthFactorIsBroken(msg.sender);
+    }
 
     /*
     * @notice follows CEI
     * @param amountDscToMint The amount of decentralized stable coin to mint
     * @notice they must have more collateral than the minimum threadhold
     */
-    function mintDsc(uint256 amountDscToMint) external moreThanZero(amountDscToMint) nonReentrant {
+    function mintDsc(uint256 amountDscToMint) public moreThanZero(amountDscToMint) nonReentrant {
         s_dscMinted[msg.sender] += amountDscToMint;
         _reverIfHealthFactorIsBroken(msg.sender);
+        bool minted = i_dsc.mint(msg.sender, amountDscToMint);
+        if (!minted) {
+            revert DSCEngine__MintFailed();
+        }
     }
 
-    function burnDsc() external {}
+    function burnDsc(uint256 amount) public moreThanZero(amount) {
+        s_dscMinted[msg.sender] -= amount;
+        bool success = i_dsc.transferFrom(msg.sender, address(this), amount);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        i_dsc.burn(amount);
+        _reverIfHealthFactorIsBroken(msg.sender); // This might never be hitted
+    }
 
-    function liquidate() external {}
+    // $75 backing $50 DSC
+    // Liquidator take $75 backing and burns off the $50 DSC
 
-    function getHealthFactor() external view returns (uint256) {}
+    // If someone is almost undercollateralized, we will pay you to liquidate them!
+    /*
+    * @param collateral The erc20 collateral address to liquidate from the user
+    * @param user the user who broken the health factor. Their _healthFactor should be below MIN_HEALTH_FACTOR
+    * @param debtToCover the amount of DSC you want to burn to imporve the users health factor
+    * @notice You can partially liquidate a user.
+    * @notice You will get a luquidation bonuse for take the users funds
+    * @notice This function working assumes the protocol will be roughly 200% overcollateralized in order for this to work.
+    * @notice A know bug would be if the protocol were 100% or less collateralized, then we wouldn't be able to incentive the liquidators.
+    * For example, if the price of the collateral plummeted before anyone could be liquidated.
+    * 
+    * Following CEI: Check-Effect-Interact
+    */
+    function liquidate(address collateral, address user, uint256 debtToCover)
+        external
+        moreThanZero(debtToCover)
+        nonReentrant
+    {
+        //need to check health factor of user
+        uint256 startingUserHealthFactor = _healthFactor(user);
+    }
+
+    function getHealthFactor() external view {}
 
     //////////////////////////////////
     // Private & Internal View Functions //
